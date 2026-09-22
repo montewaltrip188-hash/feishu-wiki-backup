@@ -105,8 +105,14 @@ UNRESOLVED_FEISHU_MARKUP_RE = re.compile(
 FENCE_OPEN_RE = re.compile(r"^[ \t]{0,3}(?P<marker>`{3,}|~{3,})")
 FENCE_CLOSE_RE = re.compile(r"^[ \t]{0,3}(?P<marker>`{3,}|~{3,})[ \t]*\r?\n?\Z")
 REQUIRED_PROFILE = "codex-bot"
-IMAGE_MODES = {"inline", "files"}
+IMAGE_MODES = {"dedup", "inline", "files"}
 INLINE_DATA_WRAP_WIDTH = 120
+IMAGE_EXTENSIONS = {
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+    "image/gif": ".gif",
+    "image/webp": ".webp",
+}
 
 
 class BackupError(RuntimeError):
@@ -172,6 +178,27 @@ def encode_image_data_uri(path: Path) -> Tuple[str, Dict[str, Any]]:
             "sha256": hashlib.sha256(data).hexdigest(),
         },
     )
+
+
+def store_deduplicated_image(source: Path, snapshot_root: Path) -> Tuple[Path, Dict[str, Any]]:
+    """Store an image once under ``_assets/<sha256>.<ext>`` and verify collisions."""
+    data = source.read_bytes()
+    mime_type = image_mime_type(data, source)
+    digest = hashlib.sha256(data).hexdigest()
+    target = snapshot_root / "_assets" / f"{digest}{IMAGE_EXTENSIONS[mime_type]}"
+    target.parent.mkdir(parents=True, exist_ok=True)
+    if target.exists():
+        if target.read_bytes() != data:
+            raise BackupError(f"哈希附件冲突，拒绝覆盖: {target.name}")
+    else:
+        target.write_bytes(data)
+    if sha256_file(target) != digest:
+        raise BackupError(f"哈希附件写入后校验失败: {target.name}")
+    return target, {
+        "mime_type": mime_type,
+        "source_bytes": len(data),
+        "sha256": digest,
+    }
 
 
 def decode_image_data_uri(data_uri: str, label: str) -> bytes:
@@ -890,11 +917,11 @@ def rewrite_media(
                 return match.group(0)
             if kind == "file":
                 label = attrs.get("name") or f"附件-{token[:8]}"
-                return f"[{label}]({path})"
+                return f"[{markdown_label(label)}]({path})"
             label = "飞书画板" if kind == "whiteboard" else (attrs.get("alt") or "飞书图片")
             if inline_image:
                 return render_inline_image(label, inline_image)
-            return f"![{label}]({path})"
+            return f"![{markdown_label(label)}]({path})"
 
         rewritten = TAG_RE.sub(replace_tag, section)
 
@@ -904,7 +931,7 @@ def rewrite_media(
             if inline_image:
                 return render_inline_image(match.group("alt"), inline_image)
             path = paths.get(("image", token))
-            return f"![{match.group('alt')}]({path})" if path else match.group(0)
+            return f"![{markdown_label(match.group('alt'))}]({path})" if path else match.group(0)
 
         return FEISHU_FILE_MD_RE.sub(replace_url, rewritten)
 
@@ -1053,6 +1080,7 @@ def build_manifest_base(
 
 def verify_report_text(report: Mapping[str, Any]) -> str:
     failures = list(report.get("failures") or [])
+    image_mode = report.get("image_mode")
     lines = [
         "# 飞书 Wiki 备份验收报告",
         "",
@@ -1065,27 +1093,45 @@ def verify_report_text(report: Mapping[str, Any]) -> str:
         f"- Docx 对象：{report.get('docx_objects')}（本次处理 {report.get('selected_docx_objects')}）",
         f"- 快捷方式：{report.get('shortcuts')}",
         f"- 不支持对象：{report.get('unsupported_objects')}",
-        f"- 内嵌视觉资源：{report.get('embedded_visuals', 0)}",
-        f"- 内嵌原图字节：{report.get('embedded_image_source_bytes', 0)}",
-        f"- Base64 字符：{report.get('embedded_base64_characters', 0)}",
+    ]
+    if image_mode == "dedup":
+        lines.extend(
+            [
+                f"- 去重图片引用：{report.get('deduplicated_visual_references', 0)}",
+                f"- 去重媒体记录：{report.get('deduplicated_media_records', 0)}",
+                f"- 唯一哈希图片：{report.get('unique_deduplicated_visuals', 0)}",
+                f"- 去重节省附件副本：{report.get('deduplicated_copies_saved', 0)}",
+            ]
+        )
+    elif image_mode == "inline":
+        lines.extend(
+            [
+                f"- 内嵌视觉资源：{report.get('embedded_visuals', 0)}",
+                f"- 内嵌原图字节：{report.get('embedded_image_source_bytes', 0)}",
+                f"- Base64 字符：{report.get('embedded_base64_characters', 0)}",
+            ]
+        )
+    lines.extend(
+        [
         f"- 最大 Markdown 字节：{report.get('max_markdown_bytes', 0)}",
+        f"- 图片已本地化的正文：{report.get('images_localized_docs', 0)}",
         f"- 图片已自包含的正文：{report.get('images_self_contained_docs', 0)}",
         f"- 无附件/HTML5 依赖的单文件正文：{report.get('standalone_markdown_docs', 0)}",
         f"- 失败项：{report.get('failed')}",
         "",
-    ]
+        ]
+    )
     large_markdown_files = list(report.get("large_markdown_files") or [])
     if large_markdown_files:
         lines.extend(["## 体积警告", ""])
         for item in large_markdown_files:
             lines.append(f"- `{item.get('path')}`：{item.get('bytes')} 字节（≥ 2 MiB）")
-        lines.extend(
-            [
-                "",
-                "> Base64 内嵌会增大 Markdown；转发便携性已提高，但目标阅读器的编辑性能仍需抽检。",
-                "",
-            ]
+        warning = (
+            "> Base64 内嵌会增大 Markdown；目标阅读器的编辑性能仍需抽检。"
+            if image_mode == "inline"
+            else "> 大文件来自正文或非图片资源；dedup 模式的图片已独立保存在 `_assets`。"
         )
+        lines.extend(["", warning, ""])
     if failures:
         lines.extend(["## 失败与未覆盖", ""])
         for item in failures:
@@ -1105,7 +1151,7 @@ def export_snapshot(
     snapshot_id: str,
     max_depth: int = -1,
     limit: Optional[int] = None,
-    image_mode: str = "inline",
+    image_mode: str = "dedup",
 ) -> Tuple[Path, Dict[str, Any]]:
     if image_mode not in IMAGE_MODES:
         raise BackupError(f"不支持的图片模式: {image_mode}")
@@ -1158,7 +1204,12 @@ def export_snapshot(
         "embedded_visuals": 0,
         "embedded_image_source_bytes": 0,
         "embedded_base64_characters": 0,
+        "deduplicated_visual_references": 0,
+        "deduplicated_media_records": 0,
+        "unique_deduplicated_visuals": 0,
+        "deduplicated_copies_saved": 0,
         "max_markdown_bytes": 0,
+        "images_localized_docs": 0,
         "images_self_contained_docs": 0,
         "standalone_markdown_docs": 0,
         "large_markdown_files": [],
@@ -1205,8 +1256,14 @@ def export_snapshot(
                     if media.kind == "whiteboard"
                     else ("attachments" if media.kind == "file" else "media")
                 )
-                embed_image = image_mode == "inline" and media.kind in {"image", "whiteboard"}
-                media_root = work_root / "embedded-media" if embed_image else staging / "assets"
+                visual_media = media.kind in {"image", "whiteboard"}
+                embed_image = image_mode == "inline" and visual_media
+                dedup_image = image_mode == "dedup" and visual_media
+                media_root = (
+                    work_root / "downloaded-media"
+                    if embed_image or dedup_image
+                    else staging / "assets"
+                )
                 prefix = media_root / category / safe_name(media.token, "asset")
                 try:
                     existing = [p for p in prefix.parent.glob(f"{prefix.name}*") if p.is_file()]
@@ -1246,9 +1303,32 @@ def export_snapshot(
                                 **image_metadata,
                             }
                         )
+                    elif dedup_image:
+                        stored, image_metadata = store_deduplicated_image(downloaded, staging)
+                        rel_from_doc = os.path.relpath(stored, markdown_path.parent).replace("\\", "/")
+                        media_paths[(media.kind, media.token)] = markdown_link_path(rel_from_doc)
+                        media_records.append(
+                            {
+                                "token": media.token,
+                                "kind": media.kind,
+                                "storage": "sha256-asset",
+                                "path": stored.relative_to(staging).as_posix(),
+                                "status": "downloaded",
+                                "occurrences": occurrence_counts.get((media.kind, media.token), 0),
+                                **(
+                                    {
+                                        "representation": "preview",
+                                        "editable_whiteboard_backed_up": False,
+                                    }
+                                    if media.kind == "whiteboard"
+                                    else {}
+                                ),
+                                **image_metadata,
+                            }
+                        )
                     else:
                         rel_from_doc = os.path.relpath(downloaded, markdown_path.parent).replace("\\", "/")
-                        media_paths[(media.kind, media.token)] = rel_from_doc
+                        media_paths[(media.kind, media.token)] = markdown_link_path(rel_from_doc)
                         media_records.append(
                             {
                                 "token": media.token,
@@ -1384,14 +1464,14 @@ def export_snapshot(
                     }
                 )
             failed_visual_media = any(
-                item.get("kind") in {"image", "whiteboard"} and item.get("status") != "embedded"
+                item.get("kind") in {"image", "whiteboard"} and item.get("status") == "failed"
                 for item in media_records
             )
+            images_localized = not failed_visual_media and remaining_media == 0
             images_self_contained = (
                 image_mode == "inline"
-                and not failed_visual_media
+                and images_localized
                 and not inline_validation_failed
-                and remaining_media == 0
             )
             standalone_markdown = (
                 images_self_contained
@@ -1418,6 +1498,7 @@ def export_snapshot(
                 "metadata_path": metadata_path.relative_to(staging).as_posix(),
                 "media": media_records,
                 "html5_sidecars": sidecar_records,
+                "images_localized": images_localized,
                 "images_self_contained": images_self_contained,
                 "standalone_markdown": standalone_markdown,
                 "remaining_media_refs": remaining_media,
@@ -1482,6 +1563,7 @@ def export_snapshot(
         if key in selected_keys and result.get("status") in {"written", "written_with_errors"}
     ]
     embedded_visuals: List[Mapping[str, Any]] = []
+    deduplicated_visuals: List[Mapping[str, Any]] = []
     for result in exported_results:
         seen_embed_ids = set()
         for item in result.get("media") or []:
@@ -1489,6 +1571,9 @@ def export_snapshot(
             if item.get("status") == "embedded" and embed_id and embed_id not in seen_embed_ids:
                 embedded_visuals.append(item)
                 seen_embed_ids.add(embed_id)
+            if item.get("status") == "downloaded" and item.get("storage") == "sha256-asset":
+                deduplicated_visuals.append(item)
+    unique_deduplicated_paths = {str(item.get("path")) for item in deduplicated_visuals}
     large_markdown_files = [
         {"path": result.get("document_path"), "bytes": result.get("markdown_bytes")}
         for result in exported_results
@@ -1511,9 +1596,18 @@ def export_snapshot(
         "embedded_base64_characters": sum(
             int(item.get("base64_characters") or 0) for item in embedded_visuals
         ),
+        "deduplicated_visual_references": sum(
+            int(item.get("occurrences") or 0) for item in deduplicated_visuals
+        ),
+        "deduplicated_media_records": len(deduplicated_visuals),
+        "unique_deduplicated_visuals": len(unique_deduplicated_paths),
+        "deduplicated_copies_saved": len(deduplicated_visuals) - len(unique_deduplicated_paths),
         "max_markdown_bytes": max(
             (int(result.get("markdown_bytes") or 0) for result in exported_results),
             default=0,
+        ),
+        "images_localized_docs": sum(
+            1 for result in exported_results if result.get("images_localized") is True
         ),
         "images_self_contained_docs": sum(
             1 for result in exported_results if result.get("images_self_contained") is True
@@ -1587,8 +1681,11 @@ def build_parser() -> argparse.ArgumentParser:
     export.add_argument(
         "--image-mode",
         choices=sorted(IMAGE_MODES),
-        default="inline",
-        help="图片与白板预览的保存方式：inline 内嵌到 Markdown（默认），files 保存为外部文件",
+        default="dedup",
+        help=(
+            "图片与白板预览的保存方式：dedup 按 SHA-256 保存到共享 _assets（默认）；"
+            "inline 为旧版 Data URI；files 按飞书 token 保存"
+        ),
     )
     return parser
 

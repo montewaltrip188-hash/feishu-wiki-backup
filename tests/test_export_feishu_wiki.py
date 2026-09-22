@@ -158,7 +158,7 @@ class MixedMediaClient(SingleDocClient):
             "document_id": token,
             "revision_id": 11,
             "content": (
-                '<img token="img1"/>'
+                '<img token="img1"/><img token="img1"/>'
                 '<whiteboard token="wb1"></whiteboard>'
                 '<source token="file1" name="附件.pdf"/>'
             ),
@@ -269,6 +269,17 @@ class BackupTests(unittest.TestCase):
         self.assertNotIn("</whiteboard>", rewritten)
         self.assertIn('<img token="example-only"/>', rewritten)
         self.assertEqual(MODULE.count_unresolved_media(rewritten), 0)
+
+    def test_file_and_image_labels_are_escaped_for_markdown(self):
+        rewritten = MODULE.rewrite_media(
+            '<img token="img1" alt="A]B\\C"/><source token="file1" name="D]E\\F.pdf"/>',
+            {
+                ("image", "img1"): "../_assets/image.png",
+                ("file", "file1"): "../assets/file.pdf",
+            },
+        )
+        self.assertIn(r"![A\]B\\C](../_assets/image.png)", rewritten)
+        self.assertIn(r"[D\]E\\F.pdf](../assets/file.pdf)", rewritten)
 
     def test_nested_list_callout_becomes_native_obsidian_callout(self):
         content = (
@@ -416,36 +427,49 @@ class BackupTests(unittest.TestCase):
             self.assertIn("飞书 HTML5 交互资源", markdown)
             self.assertNotIn("<html5-block", markdown)
 
-    def test_default_inline_mode_embeds_images_but_keeps_real_attachments(self):
+    def test_default_mode_uses_shared_sha256_assets_and_short_links(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             target, report = MODULE.export_snapshot(
                 MixedMediaClient(), "https://example/wiki/root", Path(temp_dir) / "raw", "snap"
             )
             self.assertEqual(report["status"], "completed")
-            self.assertEqual(report["image_mode"], "inline")
+            self.assertEqual(report["image_mode"], "dedup")
             markdown = next((target / "documents").rglob("*.md")).read_text(encoding="utf-8")
-            self.assertEqual(markdown.count("data:image/png;base64,"), 2)
-            self.assertEqual(markdown.count('<img alt="'), 2)
-            self.assertEqual(markdown.count('data-feishu-embed-id="'), 2)
-            self.assertNotIn("][feishu-img-", markdown)
-            self.assertNotRegex(markdown, r"(?m)^\[feishu-img-[^]]+\]: data:image/")
-            encoded = markdown.split("data:image/png;base64,", 1)[1].split('"', 1)[0]
-            self.assertEqual(base64.b64decode("".join(encoded.split()), validate=True), PNG_1X1)
+            digest = hashlib.sha256(PNG_1X1).hexdigest()
+            self.assertNotIn("data:image/", markdown)
+            self.assertEqual(markdown.count(f"_assets/{digest}.png"), 3)
             self.assertIn("assets/attachments/file1.pdf", markdown)
             self.assertFalse((target / "assets" / "whiteboard").exists())
             self.assertFalse((target / "assets" / "media").exists())
+            self.assertEqual(list((target / "_assets").glob("*")), [target / "_assets" / f"{digest}.png"])
             self.assertTrue(any((target / "assets" / "attachments").glob("file1*.pdf")))
             record = json.loads((target / "manifest.jsonl").read_text(encoding="utf-8").splitlines()[0])
             media = {(item["kind"], item["token"]): item for item in record["media"]}
-            self.assertEqual(media[("image", "img1")]["status"], "embedded")
-            self.assertEqual(media[("image", "img1")]["storage"], "html-inline-data-uri")
-            self.assertEqual(media[("whiteboard", "wb1")]["status"], "embedded")
-            self.assertEqual(media[("image", "img1")]["embed_id"], media[("whiteboard", "wb1")]["embed_id"])
+            self.assertEqual(media[("image", "img1")]["status"], "downloaded")
+            self.assertEqual(media[("image", "img1")]["storage"], "sha256-asset")
+            self.assertEqual(media[("whiteboard", "wb1")]["path"], media[("image", "img1")]["path"])
             self.assertEqual(media[("file", "file1")]["storage"], "asset-file")
-            self.assertNotIn("path", media[("image", "img1")])
-            self.assertEqual(report["embedded_visuals"], 1)
-            self.assertTrue(record["images_self_contained"])
+            self.assertEqual(report["unique_deduplicated_visuals"], 1)
+            self.assertEqual(report["deduplicated_visual_references"], 3)
+            self.assertEqual(report["deduplicated_media_records"], 2)
+            self.assertEqual(report["deduplicated_copies_saved"], 1)
+            self.assertTrue(record["images_localized"])
+            self.assertFalse(record["images_self_contained"])
             self.assertFalse(record["standalone_markdown"])
+
+    def test_explicit_inline_mode_remains_available_for_legacy_snapshots(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            target, report = MODULE.export_snapshot(
+                MixedMediaClient(),
+                "https://example/wiki/root",
+                Path(temp_dir) / "raw",
+                "snap",
+                image_mode="inline",
+            )
+            self.assertEqual(report["status"], "completed")
+            markdown = next((target / "documents").rglob("*.md")).read_text(encoding="utf-8")
+            self.assertEqual(markdown.count("data:image/png;base64,"), 3)
+            self.assertTrue(json.loads((target / "manifest.jsonl").read_text(encoding="utf-8").splitlines()[0])["images_self_contained"])
 
     def test_long_data_uri_stays_at_image_position_without_reference_tail(self):
         data_uri = "data:image/png;base64," + ("A" * 200_000)
